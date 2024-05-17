@@ -1,0 +1,139 @@
+#!/bin/bash
+
+# get the version
+is_major=0
+is_minor=0
+is_build=0
+
+# check if the user has provided only one parameter
+if [ $# -ne 1 ]; then
+	>&2 echo "ERREUR. Vous devez fournir un seul paramètre."
+	>&2 echo "Utilisation: $0 --[major|minor|build]"
+	exit 1
+elif [ "$1" == "--major" ]; then
+    is_major=1
+elif [ "$1" == "--minor" ]; then
+    is_minor=1
+elif [ "$1" == "--build" ]; then
+    is_build=1
+else
+    >&2 echo "ERREUR"
+    >&2 echo "Utilisation: $0 --[major|minor|build]"
+    exit 1
+fi
+
+# Charger le fichier de configuration
+source config
+
+# Extraire le nom du client
+tmp="$CLIENT"
+client_name=$(tr " " "_" <<< "$tmp")
+
+# Extraire les numéros de version
+IFS='.' read -r -a version_array <<< "$VERSION"
+
+# Afficher les numéros de version
+major=${version_array[0]}
+minor=${version_array[1]}
+build=${version_array[2]}
+
+# Mettre à jour les numéros de version
+if [ $is_major -eq 1 ]; then
+    major=$((major+1))
+    minor=0
+    build=0
+elif [ $is_minor -eq 1 ]; then
+    minor=$((minor+1))
+    build=0
+elif [ $is_build -eq 1 ]; then
+    build=$((build+1))
+fi
+
+new_version="${major}.${minor}.${build}"
+
+sed -i "s/VERSION=.*/VERSION=$new_version/" config
+
+# Traitement
+echo 'Création du volume'
+docker volume create sae103
+
+echo ""
+echo 'Création du container sae103-forever'
+docker run --rm --name sae103-forever -v sae103:/work -d bigpapoo/clock
+
+echo ""
+echo 'Copie des fichiers dans le volume'
+docker container cp ./gendoc-tech.php sae103-forever:/work
+docker container cp ./gendoc-user.php sae103-forever:/work
+docker container cp ./config sae103-forever:/work
+
+c_files_found=0
+# get the c files
+for file in ./*.c; do
+	if [ -f "$file" ]; then
+		c_files_found=1
+		docker container cp $file sae103-forever:/work
+	fi
+done
+if [ $c_files_found -eq 0 ]; then
+	>&2 echo "Aucun fichier C trouvé. Assurez-vous que les fichiers C sont dans le même dossier que le script bash."
+    echo "Anuulation de l'opération..."
+    docker stop sae103-forever
+    docker volume rm sae103
+	exit 1
+fi
+
+md_files_found=0
+# get the md files
+for file in ./*.md; do
+    if [ -f "$file" ]; then
+        md_files_found=1
+        docker container cp $file sae103-forever:/work
+    fi
+done
+if [ $md_files_found -eq 0 ]; then
+    >&2 echo "Aucun fichier MD trouvé. Assurez-vous que les fichiers MD sont dans le même dossier que le script bash."
+    echo "Anuulation de l'opération..."
+    docker stop sae103-forever
+    docker volume rm sae103
+    exit 1
+fi
+
+echo ""
+echo 'Lancement du conteneur php'
+docker run --rm -v sae103:/work -ti bigpapoo/sae103-php php -f /work/gendoc-tech.php > doc-tech-${new_version}.html
+docker run --rm -v sae103:/work -ti bigpapoo/sae103-php php -f /work/gendoc-user.php > doc-user-${new_version}.html
+docker container cp doc-tech-${new_version}.html sae103-forever:/work
+docker container cp doc-user-${new_version}.html sae103-forever:/work
+docker container cp sae103-forever:/work/c_used ./
+rm doc-tech-${new_version}.html
+rm doc-user-${new_version}.html
+
+echo ""
+echo 'Lancement du conteneur html2pdf'
+docker run --rm -ti -v sae103:/work bigpapoo/sae103-html2pdf "html2pdf doc-tech-${new_version}.html doc-tech-${new_version}.pdf"
+docker run --rm -ti -v sae103:/work bigpapoo/sae103-html2pdf "html2pdf doc-user-${new_version}.html doc-user-${new_version}.pdf"
+
+mkdir output
+
+docker container cp sae103-forever:/work/doc-tech-${new_version}.pdf ./output
+docker container cp sae103-forever:/work/doc-user-${new_version}.pdf ./output
+# Lire chaque ligne du fichier dans la boucle
+while IFS= read -r nom_fichier; do
+    cp $nom_fichier ./output
+done < "c_used"
+
+rm c_used
+
+echo ""
+echo "Création de l'archive finale"
+tar -czvf "${client_name}-${new_version}.tar.gz" output/*
+rm -r output
+
+echo ""
+echo 'Arrêt du conteneur sae103-forever...'
+docker stop sae103-forever
+
+echo ""
+echo 'Suppression du volume'
+docker volume rm sae103
